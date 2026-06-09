@@ -8,7 +8,7 @@ def process_job(job):
     print("Processing job:", job)
 
 def main():
-    print("Worker started...")
+    print("Worker is running")
 
     while True:
         job = get_next_job()
