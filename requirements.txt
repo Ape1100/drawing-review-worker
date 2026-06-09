@@ -1,3 +1,6 @@
+supabase
+PyMuPDF
+pdfplumber
 openai
 anthropic
 python-dotenv
