@@ -1168,11 +1168,13 @@ _STEEL_GRADE_PATTERN = (
 
 # Filler metal / electrode designations (AWS A5.x classifications)
 _FILLER_METAL_PATTERN = (
-    r"\bE\d{4,5}(?:-[A-Z0-9]+)?\b"           # SMAW: E7018, E7018-H4R
+    # SMAW: E7018, E10018-H4R — restricted to real AWS A5.1/A5.5 strength
+    # series so sheet numbers like E1001 don't false-positive
+    r"\bE(?:60|70|80|90|100|110|120)\d{2}(?:-[A-Z0-9]+)?\b"
     r"|\bE\d{2}T-?\d+[A-Z]?\b"               # FCAW: E71T-1, E70T-6
     r"|\bER\d{2}S-?\d\b"                     # GMAW/GTAW: ER70S-6
     r"|\bF\d[A-Z]\d-E[A-Z0-9]+\b"            # SAW flux-electrode: F7A2-EM12K
-    r"|\bE\d{2}(?:XX|xx)\b"                  # generic: E70XX
+    r"|\bE(?:60|70|80|90|100|110|120)(?:XX|xx)\b"  # generic: E70XX
     r"|\blow[\s-]*hydrogen\b"
 )
 
