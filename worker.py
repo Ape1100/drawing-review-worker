@@ -1647,6 +1647,10 @@ def _run_spec_conflicts_for_doc(
             pages = extract_pages(pdf_bytes, cfg.max_pages)
             conflicts = detect_spec_conflicts(provider, requirements, pages)
 
+            # Replace any conflicts from a previous run of this job/spec pair
+            sb.table("drawing_spec_conflicts").delete() \
+                .eq("job_id", dj["id"]).eq("spec_document_id", doc["id"]).execute()
+
             for c in conflicts:
                 sb.table("drawing_spec_conflicts").insert({
                     "organization_id": org_id,
@@ -1700,6 +1704,11 @@ def _run_spec_conflicts_for_job(
                 continue
 
             conflicts = detect_spec_conflicts(provider, requirements, pages)
+
+            # Replace any conflicts from a previous run of this job/spec pair
+            sb.table("drawing_spec_conflicts").delete() \
+                .eq("job_id", job["id"]).eq("spec_document_id", spec["id"]).execute()
+
             for c in conflicts:
                 sb.table("drawing_spec_conflicts").insert({
                     "organization_id": org_id,
@@ -2132,12 +2141,18 @@ def process_job(
     marking_ms = 0
 
     try:
+        # Claim the job and clear any stale results from a previous run so the
+        # UI shows a clean in-progress state during manual re-runs.
         update_job(sb, cfg, job_id, {
             "status": "running",
             "stage": "extracting",
             "progress": 5,
             "error_message": None,
+            "failure_reason": None,
             "started_at": now_iso(),
+            "completed_at": None,
+            "marked_file_path": None,
+            "summary": json.dumps({}),
             "worker_id": cfg.worker_id,
         })
 
