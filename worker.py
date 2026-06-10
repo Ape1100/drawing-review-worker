@@ -1128,6 +1128,210 @@ def run_rule_checks(pages: List[Tuple[int, str]], review_profile: str = "general
 
 
 # ---------------------------------------------------------------------------
+# Weld Callout Inventory + Steel Spec Summary
+# Deterministic text scan of weld callout types and steel/material specs,
+# plus an AI pass that builds a structured fabrication-spec summary.
+# Results are stored in the job's summary JSONB under 'weld_inventory'
+# and 'steel_specs'.
+# ---------------------------------------------------------------------------
+
+# Textual weld callout patterns (AWS A2.4 symbols are vector graphics and not
+# detectable in the text layer; these match the accompanying text callouts).
+_WELD_CALLOUT_PATTERNS: List[Tuple[str, str]] = [
+    ("fillet",            r"\bfillet(?:\s+weld)?\b"),
+    ("cjp",               r"\bCJP\b|\bcomplete\s+joint\s+penetration\b"),
+    ("pjp",               r"\bPJP\b|\bpartial\s+joint\s+penetration\b"),
+    ("groove",            r"\bgroove\s+weld\b"),
+    ("v_groove",          r"\b(?:single|double)?\s*-?\s*V[\s-]*groove\b"),
+    ("bevel_groove",      r"\bbevel[\s-]*(?:groove|weld)\b"),
+    ("j_groove",          r"\bJ[\s-]*groove\b"),
+    ("u_groove",          r"\bU[\s-]*groove\b"),
+    ("flare_bevel",       r"\bflare[\s-]*(?:bevel|V)[\s-]*(?:groove|weld)?\b"),
+    ("plug",              r"\bplug\s+weld\b"),
+    ("slot",              r"\bslot\s+weld\b"),
+    ("stud",              r"\b(?:weld(?:ed)?|shear|headed)\s+studs?\b|\bstud\s+weld(?:ing)?\b"),
+    ("seal",              r"\bseal\s+weld\b"),
+    ("tack",              r"\btack\s+weld\b"),
+    ("spot",              r"\bspot\s+weld\b"),
+    ("butt",              r"\bbutt\s+weld\b"),
+    ("intermittent",      r"\b(?:intermittent|stitch)\s+weld\b"),
+    ("field_weld",        r"\bfield\s+weld\b"),
+    ("all_around",        r"\b(?:weld\s+)?all[\s-]*around\b"),
+]
+
+# Steel material grade patterns
+_STEEL_GRADE_PATTERN = (
+    r"\b(?:ASTM\s+)?(A(?:36|53|108|123|153|307|325|354|449|490|500|501|514|529|563|"
+    r"572|588|618|653|709|913|992|1011|1043|1085)|F(?:1554|3125|436))"
+    r"(?:[\s,]*(?:Gr(?:ade)?\.?\s*)?(50|55|60|65|42|46|36|105|[A-C])\b)?"
+)
+
+# Filler metal / electrode designations (AWS A5.x classifications)
+_FILLER_METAL_PATTERN = (
+    r"\bE\d{4,5}(?:-[A-Z0-9]+)?\b"           # SMAW: E7018, E7018-H4R
+    r"|\bE\d{2}T-?\d+[A-Z]?\b"               # FCAW: E71T-1, E70T-6
+    r"|\bER\d{2}S-?\d\b"                     # GMAW/GTAW: ER70S-6
+    r"|\bF\d[A-Z]\d-E[A-Z0-9]+\b"            # SAW flux-electrode: F7A2-EM12K
+    r"|\bE\d{2}(?:XX|xx)\b"                  # generic: E70XX
+    r"|\blow[\s-]*hydrogen\b"
+)
+
+_CVN_LINE_PATTERN = r"(?:CVN|[Cc]harpy)"
+
+
+def _grab_line(text: str, start: int, end: int) -> str:
+    ls = text.rfind("\n", 0, start) + 1
+    le = text.find("\n", end)
+    if le == -1:
+        le = len(text)
+    return " ".join(text[ls:le].split())
+
+
+def scan_weld_callouts(pages: List[Tuple[int, str]]) -> Dict[str, Any]:
+    """Count textual weld callout types across all pages."""
+    by_type: Dict[str, Dict[str, Any]] = {}
+    for pno, text in pages:
+        if not text.strip():
+            continue
+        for weld_type, pattern in _WELD_CALLOUT_PATTERNS:
+            count = len(_re.findall(pattern, text, _re.IGNORECASE))
+            if count:
+                entry = by_type.setdefault(weld_type, {"count": 0, "pages": []})
+                entry["count"] += count
+                if pno not in entry["pages"]:
+                    entry["pages"].append(pno)
+    return {
+        "total_callouts": sum(e["count"] for e in by_type.values()),
+        "by_type": by_type,
+        "note": "Counts are based on text callouts; graphical AWS A2.4 weld symbols are not text-detectable.",
+    }
+
+
+def scan_steel_specs(pages: List[Tuple[int, str]]) -> Dict[str, Any]:
+    """Collect steel grades, CVN requirement lines, and filler metal mentions."""
+    grades: Dict[str, Dict[str, Any]] = {}
+    cvn_lines: List[Dict[str, Any]] = []
+    filler: Dict[str, Dict[str, Any]] = {}
+
+    for pno, text in pages:
+        if not text.strip():
+            continue
+
+        for m in _re.finditer(_STEEL_GRADE_PATTERN, text, _re.IGNORECASE):
+            spec = m.group(1).upper()
+            grade_suffix = (m.group(2) or "").upper()
+            key = f"{spec} Gr.{grade_suffix}" if grade_suffix else spec
+            entry = grades.setdefault(key, {"count": 0, "pages": []})
+            entry["count"] += 1
+            if pno not in entry["pages"]:
+                entry["pages"].append(pno)
+
+        for m in _re.finditer(_CVN_LINE_PATTERN, text):
+            line = _grab_line(text, m.start(), m.end())
+            if line and not any(c["text"] == line for c in cvn_lines):
+                cvn_lines.append({"page": pno, "text": line[:300]})
+
+        for m in _re.finditer(_FILLER_METAL_PATTERN, text, _re.IGNORECASE):
+            key = " ".join(m.group(0).upper().split())
+            entry = filler.setdefault(key, {"count": 0, "pages": [], "example_line": ""})
+            entry["count"] += 1
+            if pno not in entry["pages"]:
+                entry["pages"].append(pno)
+            if not entry["example_line"]:
+                entry["example_line"] = _grab_line(text, m.start(), m.end())[:300]
+
+    return {
+        "grades": grades,
+        "cvn_lines": cvn_lines[:30],
+        "filler_metal": filler,
+    }
+
+
+_STEEL_SPEC_SYSTEM = (
+    "You are a structural steel fabrication specification analyst. "
+    "You are given (a) raw scanner hits for steel grades, CVN/Charpy lines, and filler metal "
+    "designations found in a drawing package, and (b) excerpts of the drawing text related to "
+    "steel and steel fabrication. Produce a concise structured summary for a QC reviewer.\n"
+    "Return ONLY valid JSON with this structure:\n"
+    "{\n"
+    "  \"steel_grades\": [{\"grade\": str, \"application\": str}],\n"
+    "  \"cvn_requirements\": [str],\n"
+    "  \"filler_metal_requirements\": [str],\n"
+    "  \"fabrication_notes\": [str]\n"
+    "}\n"
+    "For steel_grades, state what each grade is used for when the text makes it clear "
+    "(e.g. 'A992 - wide flange shapes'). For cvn_requirements, state temperature/energy values "
+    "verbatim when present. Keep every list item to one sentence. Use empty lists when no data exists."
+)
+
+_SPEC_KEYWORD_PATTERN = (
+    r"(?:steel|weld|CVN|charpy|electrode|filler|ASTM|fabricat|galvaniz|bolt|AISC|AWS)"
+)
+
+
+def summarize_steel_specs(
+    provider: AIProvider,
+    pages: List[Tuple[int, str]],
+    spec_scan: Dict[str, Any],
+) -> Dict[str, Any]:
+    """One AI call that turns scanner hits + relevant text into a structured spec summary."""
+    # Pull only the lines that mention steel/welding topics, capped for token budget
+    relevant_lines: List[str] = []
+    budget = 30000
+    used = 0
+    for pno, text in pages:
+        if used >= budget:
+            break
+        for line in text.splitlines():
+            line = line.strip()
+            if len(line) >= 8 and _re.search(_SPEC_KEYWORD_PATTERN, line, _re.IGNORECASE):
+                tagged = f"[p{pno}] {line[:300]}"
+                relevant_lines.append(tagged)
+                used += len(tagged)
+                if used >= budget:
+                    break
+
+    payload = {
+        "scanner_hits": spec_scan,
+        "relevant_text_lines": relevant_lines,
+    }
+    raw = provider.complete(_STEEL_SPEC_SYSTEM, json.dumps(payload), temperature=0.1)
+    raw = raw.strip()
+    if raw.startswith("```"):
+        raw = raw.split("```")[1]
+        if raw.startswith("json"):
+            raw = raw[4:]
+    return json.loads(raw)
+
+
+def build_steel_inventory(
+    provider: AIProvider, pages: List[Tuple[int, str]]
+) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+    """
+    Run the weld callout scan and the steel spec scan + AI summary.
+    Returns (weld_inventory, steel_specs); failures degrade gracefully.
+    """
+    weld_inventory: Dict[str, Any] = {}
+    steel_specs: Dict[str, Any] = {}
+    try:
+        weld_inventory = scan_weld_callouts(pages)
+    except Exception as e:
+        print(f"  [inventory] weld callout scan failed (non-fatal): {e}")
+
+    try:
+        spec_scan = scan_steel_specs(pages)
+        steel_specs = {"scanned": spec_scan}
+        try:
+            steel_specs["summary"] = summarize_steel_specs(provider, pages, spec_scan)
+        except Exception as e:
+            print(f"  [inventory] AI spec summary failed (non-fatal): {e}")
+    except Exception as e:
+        print(f"  [inventory] steel spec scan failed (non-fatal): {e}")
+
+    return weld_inventory, steel_specs
+
+
+# ---------------------------------------------------------------------------
 # Revision Comparison (AI-powered diff between two drawing text corpora)
 # ---------------------------------------------------------------------------
 
@@ -2007,6 +2211,16 @@ def process_job(
             combined_contract += f"\n\n--- EXTRACTED SCHEDULE/TABLE DATA ---\n{table_context}"
 
         result = analyze_drawing(provider, discipline, pages, contract_prompt=combined_contract)
+
+        # Stage 4c: Weld callout inventory + steel spec summary
+        weld_inventory, steel_specs = build_steel_inventory(provider, pages)
+        if weld_inventory.get("total_callouts"):
+            print(f"[job:{job_id[:8]}] Weld callouts: {weld_inventory['total_callouts']} "
+                  f"across {len(weld_inventory.get('by_type', {}))} types")
+        grades_found = list((steel_specs.get("scanned") or {}).get("grades") or {})
+        if grades_found:
+            print(f"[job:{job_id[:8]}] Steel grades: {', '.join(grades_found[:10])}")
+
         analysis_ms = _ms_since(analysis_start)
         update_job(sb, cfg, job_id, {"progress": 75, "analysis_duration_ms": analysis_ms})
 
@@ -2069,6 +2283,8 @@ def process_job(
             "tables_extracted": len(extracted_tables),
             "findings_filtered": filtered_count,
             "pdf_type": pdf_info["pdf_type"],
+            "weld_inventory": weld_inventory,
+            "steel_specs": steel_specs,
         }
         for f in findings:
             cat = f.get("category", "other")
