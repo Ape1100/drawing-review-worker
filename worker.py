@@ -24,7 +24,16 @@ try:
 except ImportError:
     HAS_CAMELOT = False
 
-load_dotenv()
+# Load .env from the working directory, falling back to a stable per-user
+# config path (cloud-synced folders like ~/Documents can render local files
+# temporarily unreadable, e.g. OSError 11 on macOS/iCloud).
+try:
+    load_dotenv()
+except OSError:
+    pass
+_FALLBACK_ENV = os.path.expanduser("~/.config/drawing-review-worker/.env")
+if not os.getenv("SUPABASE_URL") and os.path.exists(_FALLBACK_ENV):
+    load_dotenv(_FALLBACK_ENV)
 
 
 # ---------------------------------------------------------------------------
