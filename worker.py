@@ -741,12 +741,24 @@ _ANALYSIS_OUTPUT_SCHEMA = {
             "description": "string",
             "page_number": "integer",
             "detail_ref": "string|null",
-            "evidence": "string|null",
+            "evidence": "string - REQUIRED: short VERBATIM snippet (3-15 words) copied character-for-character from the page text where the issue appears",
             "confidence": "number 0-1",
-            "bbox": "object|null - {x0, y0, x1, y1} in PDF points if known, else null"
+            "bbox": "object|null - {x0, y0, x1, y1} in PDF points (origin top-left) ONLY if actual coordinates are known, else null"
         }
     ]
 }
+
+# Appended to every analysis system prompt so findings carry locatable evidence.
+_LOCATION_INSTRUCTION = (
+    "\n\nLOCATION DATA (required for annotation placement):\n"
+    "- For EVERY finding, set 'evidence' to a short snippet (3-15 words) copied VERBATIM, "
+    "character-for-character, from the page text where the issue appears. Do not paraphrase, "
+    "do not change capitalization or punctuation — the snippet is used to search the PDF page "
+    "and draw a highlight box at the exact location.\n"
+    "- Prefer distinctive snippets (callouts, dimension strings, note numbers) over generic words.\n"
+    "- Set 'bbox' to {x0, y0, x1, y1} in PDF points (origin top-left) only when you can identify "
+    "actual coordinates; otherwise set it to null and rely on the 'evidence' snippet."
+)
 
 
 def analyze_drawing(
@@ -755,7 +767,7 @@ def analyze_drawing(
     pages: List[Tuple[int, str]],
     contract_prompt: str = "",
 ) -> Dict[str, Any]:
-    system_prompt = _SYSTEM_PROMPTS.get(discipline, _DEFAULT_SYSTEM)
+    system_prompt = _SYSTEM_PROMPTS.get(discipline, _DEFAULT_SYSTEM) + _LOCATION_INSTRUCTION
 
     page_packets = [
         {"page_number": pno, "text": txt[:12000]}
@@ -1077,7 +1089,8 @@ def run_rule_checks(pages: List[Tuple[int, str]], review_profile: str = "general
                 continue
 
             # Check trigger pattern
-            if not _re.search(rule.trigger_pattern, text, _re.IGNORECASE):
+            match = _re.search(rule.trigger_pattern, text, _re.IGNORECASE)
+            if not match:
                 continue
 
             # Check required context pattern (must ALSO be present)
@@ -1088,6 +1101,14 @@ def run_rule_checks(pages: List[Tuple[int, str]], review_profile: str = "general
             if rule.absence_pattern and _re.search(rule.absence_pattern, text, _re.IGNORECASE):
                 continue
 
+            # Capture the full text line containing the match so the bbox
+            # resolver can locate it on the page via search_for().
+            line_start = text.rfind("\n", 0, match.start()) + 1
+            line_end = text.find("\n", match.end())
+            if line_end == -1:
+                line_end = len(text)
+            matched_line = text[line_start:line_end].strip()
+
             fired.add(rule.rule_id)
             findings.append({
                 "severity": rule.severity,
@@ -1096,7 +1117,9 @@ def run_rule_checks(pages: List[Tuple[int, str]], review_profile: str = "general
                 "description": rule.description,
                 "page_number": pno,
                 "confidence": rule.confidence,
-                "evidence": f"Rule {rule.rule_id} matched on page {pno}",
+                "evidence": matched_line or match.group(0),
+                "match_text": match.group(0),
+                "rule_id": rule.rule_id,
                 "bbox": None,
                 "source": "rule_engine",
             })
@@ -1533,8 +1556,9 @@ _HIT_MARGIN = 4  # pts
 
 def _find_text_rect(page: fitz.Page, text: str) -> Optional[fitz.Rect]:
     """Search for the first occurrence of text on a page, return its rect."""
-    if not text or len(text) < 4:
+    if not text or len(text.strip()) < 4:
         return None
+    text = " ".join(text.split())  # collapse whitespace/newlines
     # Try the full text first, then progressively shorter prefixes
     for candidate in [text, text[:80], text[:40]]:
         hits = page.search_for(candidate.strip(), quads=False)
@@ -1543,6 +1567,111 @@ def _find_text_rect(page: fitz.Page, text: str) -> Optional[fitz.Rect]:
             return fitz.Rect(r.x0 - _HIT_MARGIN, r.y0 - _HIT_MARGIN,
                              r.x1 + _HIT_MARGIN, r.y1 + _HIT_MARGIN)
     return None
+
+
+def _candidate_snippets(finding: Dict[str, Any]) -> List[str]:
+    """
+    Ordered list of text snippets worth searching for on the page:
+    verbatim evidence first (most precise), then matched_text/title,
+    then key phrases pulled from the longer context/description.
+    """
+    snippets: List[str] = []
+
+    def add(s: Any) -> None:
+        if isinstance(s, str):
+            s = s.strip()
+            if len(s) >= 4 and s not in snippets:
+                snippets.append(s)
+
+    add(finding.get("evidence"))
+    add(finding.get("match_text"))
+    add(finding.get("matched_text"))
+    add(finding.get("title"))
+    add(finding.get("detail_ref"))
+
+    # Quoted fragments in the description often cite drawing text verbatim
+    context = finding.get("context_text") or finding.get("description") or ""
+    for quoted in _re.findall(r"[\"\u201c']([^\"\u201d']{4,80})[\"\u201d']", context):
+        add(quoted)
+
+    # Fall back to short phrases from the context, longest first
+    phrases = [p.strip() for p in _re.split(r"[.;\n]", context)]
+    for p in sorted(phrases, key=len, reverse=True)[:3]:
+        if 8 <= len(p) <= 80:
+            add(p)
+
+    return snippets[:8]
+
+
+def _validated_bbox_rect(raw_bbox: Any, page_rect: fitz.Rect) -> Optional[fitz.Rect]:
+    """
+    Convert a stored/AI-provided bbox dict to a Rect, accepting it only if it
+    is a plausible region: positive area, inside the page, and not covering
+    most of the sheet (a common AI-hallucination pattern).
+    """
+    if not raw_bbox or not isinstance(raw_bbox, dict):
+        return None
+    try:
+        rect = fitz.Rect(
+            float(raw_bbox.get("x0", 0)), float(raw_bbox.get("y0", 0)),
+            float(raw_bbox.get("x1", 0)), float(raw_bbox.get("y1", 0)),
+        )
+    except (TypeError, ValueError):
+        return None
+    if rect.is_empty or rect.x1 <= rect.x0 or rect.y1 <= rect.y0:
+        return None
+    if not page_rect.contains(rect):
+        return None
+    if rect.get_area() > 0.5 * page_rect.get_area():
+        return None
+    return rect
+
+
+def _resolve_finding_rect(page: fitz.Page, finding: Dict[str, Any]) -> Optional[fitz.Rect]:
+    """
+    Best-effort location for a finding on its page:
+    1. a provided bbox that passes validation,
+    2. text search over candidate snippets.
+    """
+    rect = _validated_bbox_rect(finding.get("bbox"), page.rect)
+    if rect is not None:
+        return rect
+    for snippet in _candidate_snippets(finding):
+        rect = _find_text_rect(page, snippet)
+        if rect is not None:
+            return rect
+    return None
+
+
+def resolve_finding_bboxes(pdf_bytes: bytes, findings: List[Dict[str, Any]]) -> int:
+    """
+    Fill in finding['bbox'] (PDF-point coordinates) for every finding that can
+    be located on its page, replacing invalid AI-provided boxes. Mutates the
+    findings in place and returns how many ended up with a bbox.
+    """
+    if not findings:
+        return 0
+    located = 0
+    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+    try:
+        for f in findings:
+            pno = int(f.get("page_number") or 1)
+            if not 1 <= pno <= len(doc):
+                f["bbox"] = None
+                continue
+            page = doc.load_page(pno - 1)
+            rect = _resolve_finding_rect(page, f)
+            if rect is not None:
+                f["bbox"] = {
+                    "x0": round(rect.x0, 2), "y0": round(rect.y0, 2),
+                    "x1": round(rect.x1, 2), "y1": round(rect.y1, 2),
+                }
+                located += 1
+            else:
+                f["bbox"] = None
+    finally:
+        doc.close()
+    return located
 
 
 def _place_finding_annotation(
@@ -1559,26 +1688,9 @@ def _place_finding_annotation(
     severity = finding.get("severity", "info")
     stroke, fill, label_bg = _SEVERITY_COLORS.get(severity, _DEFAULT_COLOR)
     num = finding_index + 1
-    title = (finding.get("matched_text") or finding.get("title") or "")[:60]
 
-    # --- Determine location ---
-    rect: Optional[fitz.Rect] = None
-
-    raw_bbox = finding.get("bbox")
-    if raw_bbox and isinstance(raw_bbox, dict):
-        try:
-            x0 = float(raw_bbox.get("x0", 0))
-            y0 = float(raw_bbox.get("y0", 0))
-            x1 = float(raw_bbox.get("x1", 0))
-            y1 = float(raw_bbox.get("y1", 0))
-            if x1 > x0 and y1 > y0:
-                rect = fitz.Rect(x0 - _HIT_MARGIN, y0 - _HIT_MARGIN,
-                                 x1 + _HIT_MARGIN, y1 + _HIT_MARGIN)
-        except (TypeError, ValueError):
-            pass
-
-    if rect is None:
-        rect = _find_text_rect(page, title)
+    # --- Determine location: validated bbox, then multi-snippet text search ---
+    rect = _resolve_finding_rect(page, finding)
 
     # Fallback: place a numbered badge in the right margin at an evenly-spaced Y position
     if rect is None:
@@ -1915,6 +2027,13 @@ def process_job(
         findings, filtered_count = filter_findings_by_confidence(all_findings, conf_threshold)
         if filtered_count > 0:
             print(f"[job:{job_id[:8]}] Filtered {filtered_count} low-confidence findings (threshold={conf_threshold})")
+
+        # Resolve bbox coordinates (validated AI bbox or text-search) before insert
+        try:
+            located = resolve_finding_bboxes(pdf_bytes, findings)
+            print(f"[job:{job_id[:8]}] Located {located}/{len(findings)} findings on-page (bbox resolved)")
+        except Exception as bbox_err:
+            print(f"[job:{job_id[:8]}] bbox resolution failed (non-fatal): {bbox_err}")
 
         inserted = insert_findings(sb, cfg, job_id, org_id, findings)
         print(f"[job:{job_id[:8]}] Inserted {len(findings)} findings ({len(rule_findings)} rules + {len(deduped_ai)} AI, {filtered_count} filtered)")
