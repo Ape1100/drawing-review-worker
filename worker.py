@@ -1649,7 +1649,7 @@ def _draw_legend_page(doc: fitz.Document, findings: List[Dict[str, Any]]) -> Non
     y = 50
 
     page.insert_text(fitz.Point(50, y), "QC Review — Findings Legend", fontsize=16,
-                     color=(0.1, 0.1, 0.1), fontname="Helv-Bold")
+                     color=(0.1, 0.1, 0.1), fontname="hebo")
     y += 30
     page.insert_text(fitz.Point(50, y),
                      f"Total findings: {len(findings)}", fontsize=10,
@@ -1657,11 +1657,11 @@ def _draw_legend_page(doc: fitz.Document, findings: List[Dict[str, Any]]) -> Non
     y += 20
 
     # Column headers
-    page.insert_text(fitz.Point(50, y), "#", fontsize=9, color=(0.2, 0.2, 0.2), fontname="Helv-Bold")
-    page.insert_text(fitz.Point(70, y), "Sev", fontsize=9, color=(0.2, 0.2, 0.2), fontname="Helv-Bold")
-    page.insert_text(fitz.Point(110, y), "Pg", fontsize=9, color=(0.2, 0.2, 0.2), fontname="Helv-Bold")
-    page.insert_text(fitz.Point(135, y), "Category", fontsize=9, color=(0.2, 0.2, 0.2), fontname="Helv-Bold")
-    page.insert_text(fitz.Point(230, y), "Title", fontsize=9, color=(0.2, 0.2, 0.2), fontname="Helv-Bold")
+    page.insert_text(fitz.Point(50, y), "#", fontsize=9, color=(0.2, 0.2, 0.2), fontname="hebo")
+    page.insert_text(fitz.Point(70, y), "Sev", fontsize=9, color=(0.2, 0.2, 0.2), fontname="hebo")
+    page.insert_text(fitz.Point(110, y), "Pg", fontsize=9, color=(0.2, 0.2, 0.2), fontname="hebo")
+    page.insert_text(fitz.Point(135, y), "Category", fontsize=9, color=(0.2, 0.2, 0.2), fontname="hebo")
+    page.insert_text(fitz.Point(230, y), "Title", fontsize=9, color=(0.2, 0.2, 0.2), fontname="hebo")
     y += 14
 
     # Divider
@@ -1685,7 +1685,7 @@ def _draw_legend_page(doc: fitz.Document, findings: List[Dict[str, Any]]) -> Non
         title = (f.get("matched_text") or f.get("title") or "")[:55]
 
         page.insert_text(fitz.Point(50, y), str(i + 1), fontsize=8, color=(0.1, 0.1, 0.1), fontname="Helv")
-        page.insert_text(fitz.Point(70, y), sev[:4].upper(), fontsize=8, color=tc, fontname="Helv-Bold")
+        page.insert_text(fitz.Point(70, y), sev[:4].upper(), fontsize=8, color=tc, fontname="hebo")
         page.insert_text(fitz.Point(110, y), str(pno), fontsize=8, color=(0.1, 0.1, 0.1), fontname="Helv")
         page.insert_text(fitz.Point(135, y), cat, fontsize=8, color=(0.1, 0.1, 0.1), fontname="Helv")
         page.insert_text(fitz.Point(230, y), title, fontsize=8, color=(0.1, 0.1, 0.1), fontname="Helv")
