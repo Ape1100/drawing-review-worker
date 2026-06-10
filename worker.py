@@ -2146,53 +2146,78 @@ def main() -> None:
 
     loop_count = 0
     last_recovery_check = 0.0
+    consecutive_errors = 0
 
     while True:
-        loop_count += 1
+        # Transient network/API errors (sleep/wake, Wi-Fi drops, Supabase
+        # hiccups) must not kill the worker — back off and keep polling.
+        try:
+            loop_count += 1
 
-        # Periodic heartbeat and stuck job recovery (every 60s)
-        now = time.time()
-        if now - last_recovery_check > 60:
-            last_recovery_check = now
-            queue_depth = get_queue_depth(sb, cfg)
-            metrics.heartbeat(queue_depth)
-            recovered = recover_stuck_jobs(sb, cfg)
-            if recovered > 0:
-                print(f"[main] Recovered {recovered} stuck jobs")
+            # Periodic heartbeat and stuck job recovery (every 60s)
+            now = time.time()
+            if now - last_recovery_check > 60:
+                last_recovery_check = now
+                queue_depth = get_queue_depth(sb, cfg)
+                metrics.heartbeat(queue_depth)
+                recovered = recover_stuck_jobs(sb, cfg)
+                if recovered > 0:
+                    print(f"[main] Recovered {recovered} stuck jobs")
 
-        # Drawing review jobs take priority
-        job = fetch_next_job(sb, cfg)
-        if job:
-            process_job(sb, cfg, provider, job, metrics)
-            time.sleep(1)
-            continue
+            # Drawing review jobs take priority
+            job = fetch_next_job(sb, cfg)
+            if job:
+                process_job(sb, cfg, provider, job, metrics)
+                consecutive_errors = 0
+                time.sleep(1)
+                continue
 
-        # Check for retryable failed jobs
-        retryable = fetch_retryable_jobs(sb, cfg)
-        if retryable:
-            rjob = retryable[0]
-            rjob_id = str(rjob["id"])
-            print(f"[job:{rjob_id[:8]}] Auto-retrying (attempt #{rjob.get('retry_count', 0)})")
-            metrics.job_retried(rjob.get("organization_id", ""), rjob_id, int(rjob.get("retry_count", 0)))
-            update_job(sb, cfg, rjob_id, {"status": "queued", "retry_after": None})
-            time.sleep(1)
-            continue
+            # Check for retryable failed jobs
+            retryable = fetch_retryable_jobs(sb, cfg)
+            if retryable:
+                rjob = retryable[0]
+                rjob_id = str(rjob["id"])
+                print(f"[job:{rjob_id[:8]}] Auto-retrying (attempt #{rjob.get('retry_count', 0)})")
+                metrics.job_retried(rjob.get("organization_id", ""), rjob_id, int(rjob.get("retry_count", 0)))
+                update_job(sb, cfg, rjob_id, {"status": "queued", "retry_after": None})
+                time.sleep(1)
+                continue
 
-        # Then revision comparisons
-        comp = fetch_next_comparison(sb, cfg)
-        if comp:
-            process_revision_comparison(sb, cfg, provider, comp)
-            time.sleep(1)
-            continue
+            # Then revision comparisons
+            comp = fetch_next_comparison(sb, cfg)
+            if comp:
+                process_revision_comparison(sb, cfg, provider, comp)
+                time.sleep(1)
+                continue
 
-        # Then spec document processing
-        spec_doc = fetch_next_spec_document(sb, cfg)
-        if spec_doc:
-            process_spec_document(sb, cfg, provider, spec_doc)
-            time.sleep(1)
-            continue
+            # Then spec document processing
+            spec_doc = fetch_next_spec_document(sb, cfg)
+            if spec_doc:
+                process_spec_document(sb, cfg, provider, spec_doc)
+                time.sleep(1)
+                continue
 
-        time.sleep(cfg.poll_interval_seconds)
+            consecutive_errors = 0
+            time.sleep(cfg.poll_interval_seconds)
+
+        except KeyboardInterrupt:
+            print("[main] Interrupted — shutting down")
+            raise
+        except Exception as loop_err:
+            consecutive_errors += 1
+            backoff = min(300, cfg.poll_interval_seconds * (2 ** min(consecutive_errors, 6)))
+            print(f"[main] Poll loop error (#{consecutive_errors}, retrying in {backoff}s): "
+                  f"{type(loop_err).__name__}: {loop_err}")
+            time.sleep(backoff)
+            # Rebuild the Supabase client after repeated failures in case the
+            # underlying HTTP connection pool is wedged.
+            if consecutive_errors >= 3:
+                try:
+                    sb = supabase_client(cfg)
+                    metrics = MetricsRecorder(sb, cfg.worker_id)
+                    print("[main] Rebuilt Supabase client after repeated errors")
+                except Exception as rebuild_err:
+                    print(f"[main] Client rebuild failed: {rebuild_err}")
 
 
 if __name__ == "__main__":
